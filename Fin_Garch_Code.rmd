@@ -1,0 +1,351 @@
+---
+title: "Kostyantyn Hrytsyuk & Khrystyna Kubatska. Finances Project"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+```{r}
+require(dplyr)
+require(ggplot2)
+require(xts)
+require(rugarch)
+require(PerformanceAnalytics)
+require(quantmod)
+library(skewt)
+```
+
+```{r}
+# Configure propet path to the Funds.csv file here
+# setwd('./')
+```
+
+
+```{r}
+read_funds <- function(lf) {
+  dfs <- list()
+ browser()
+  for (f in 1:length(lf)) {
+      cond <- substr(lf[f], nchar(lf[f])-3, nchar(lf[f])) == '.csv'
+      if (cond) {
+      temp <- data.frame(read.csv(lf[f], stringsAsFactors = FALSE))
+      temp$Date <- as.Date(temp$Date)
+      temp$Close <- as.numeric(temp$Close)
+      dfs[[f]] <- temp[,c(1,5)]
+    }
+  }
+
+  return(dfs)
+}
+
+funds_names <- c("Vanguard", "Blackrock", "Statestreet", 
+                     "JPmorgan", "Bankmellon", "Allianz")
+```
+
+```{r}
+# Forming set of parameters for different GARCH model
+get_garch_specs <- function() {
+
+  # Standard GARCH with normal distribution of errors
+  norm_garch_spec <- ugarchspec(mean.model = list(armaOrder = c(0,0)),
+                         variance.model = list(model = 'sGARCH'),
+                         distribution.model = 'norm')
+  
+  # GJR GARCH with normal distribution of errors
+  norm_gjr_spec <- ugarchspec(mean.model = list(armaOrder = c(0,0)),
+                         variance.model = list(model = 'gjrGARCH'),
+                         distribution.model = 'norm')
+  
+  # Standard GARCH with skewed Student t distribution of errors
+  sstd_garch_spec <- ugarchspec(mean.model = list(armaOrder = c(0,0)),
+                         variance.model = list(model = 'sGARCH'),
+                         distribution.model = 'sstd')
+  
+  # GJR GARCH with skewed Student t distribution of errors
+  sstd_gjr_spec <- ugarchspec(mean.model = list(armaOrder = c(0,0)),
+                         variance.model = list(model = 'gjrGARCH'),
+                         distribution.model = 'sstd')
+  
+  garch_specs <- list(norm_garch_spec, norm_gjr_spec,
+                       sstd_garch_spec, sstd_gjr_spec)
+  
+  return(garch_specs)
+}
+```
+
+```{r}
+# Apply GARCH model to our data
+get_garch_fits <- function(fund) {
+  garch_specs <- get_garch_specs()
+  
+  garch_fits <- list()
+
+  for (s in 1:length(garch_specs)) {
+    suppressWarnings(garch_fits[[s]] <- ugarchfit(data = fund,
+                                                  spec = garch_specs[[s]]))
+  }
+  
+  return(garch_fits)
+}
+
+# Visualizing standardized residuals for models
+visualize_residuals <- function(garch_fits) {
+  for (f in 1:length(garch_fits)) {
+    chart.Histogram(residuals(garch_fits[[f]], standardize = T),
+                  methods = c('add.normal', 'add.density'), 
+                  main = paste('Standardized residuals of',names(garch_fits)[f]))
+  }  
+}
+
+# Models validation
+test_garch_models <- function(garch_fits) {
+  for (f in 1:length(garch_fits)) {
+      standard_residuals <- residuals(garch_fits[[f]], standardize = T)
+      p <- acf(abs(standard_residuals),22, plot = F)
+      plot(p, main = names(garch_fits)[f])
+      cat('\n', names(garch_fits)[f],'\n')
+      print(Box.test(abs(standard_residuals), 22, type = 'Ljung-Box'))
+  }  
+}
+
+#Coefficients 
+print_garch_coefficients <- function(garch_fits) {
+  for (f in 1:length(garch_fits)) {
+    cat('\nCoefficients of', names(garch_fits)[f], '\n')
+    print(round(garch_fits[[f]]@fit$matcoef,10))
+  
+    cat('\nRobust coefficients of', names(garch_fits)[f], '\n')
+    print(round(garch_fits[[f]]@fit$robust.matcoef,10))  
+  }  
+}
+
+# Models comparing
+compare_garch_models <- function(garch_fits, short_model_names) {
+  model_comparison <- data.frame()
+
+  for (f in 1:length(garch_fits)) {
+      temp <- data.frame()
+      temp[1,1] <- likelihood(garch_fits[[f]])
+      inf_criterion <- infocriteria(garch_fits[[f]])
+      
+      temp <- rbind(temp, inf_criterion)
+      
+      model_comparison <- c(model_comparison, temp)
+  }
+  model_comparison <- as.data.frame(model_comparison)
+  
+  rownames(model_comparison) <- c('Likelihood',rownames(inf_criterion))
+  colnames(model_comparison) <- short_model_names
+  print(model_comparison)  
+}
+
+# Visualizing impact of negative previous return on variance
+visualize_dependecy_ret_var <- function(garch_fits, short_model_names) {
+  p <- ggplot()
+
+  for (f in 1:length(garch_fits)) {
+    garch_news <- as.data.frame(newsimpact(garch_fits[[f]])[1:2])
+    
+    model_name <- short_model_names[f]
+    model_name <- enquo(model_name)
+    
+    p <- p + geom_line(data = garch_news, 
+              aes(x = zx, y = zy, color = !!model_name))
+  }
+  
+  p <- p + labs(x = 'Error', y = 'Variance', 
+         title = 'Dependence of variance on errors in different models') +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p)
+}
+
+
+# Visualizing volatility
+visualizing_volatility <- function(garch_fits, short_model_names, fund_vol) {
+  p <- ggplot()
+  garch_vol <- list()
+  for (f in 1:length(garch_fits)) {
+    garch_vol[[f]] <- sigma(garch_fits[[f]])
+    
+    model_name <- short_model_names[f]
+    model_name <- enquo(model_name)
+    
+    p <- p + geom_line(data = garch_vol[[f]], aes(x = index(garch_vol[[f]][,1]),
+                                         y = garch_vol[[f]][,1],
+                                         color = !!model_name), alpha = 0.2)
+  }
+  
+  names(garch_vol) <- short_model_names
+  
+  p <- p + geom_line(data = fund_vol, aes(y = fund_vol[,1], x = index(fund_vol[,1]),
+                                     color = 'Actual volatility')) +
+       labs(x = 'Date', y = 'Volatility', 
+            title = 'Volatility constructed by different models') +
+       theme(plot.title = element_text(hjust = 0.5))
+  
+  suppressMessages(suppressWarnings(print(p)))
+  
+  return(garch_vol)
+}
+
+# Predicting volatility for n.ahead periods
+predict_volatility <- function(garch_fits, garch_vol,
+                               fund_vol, short_model_names) {
+  fund_tail_volatility <- tail(fund_vol,10)
+  predict_results <- data.frame(fund_tail_volatility)
+  garch_sst <- c()
+  for (f in 1:length(garch_fits)) {
+    garch_forecast <- ugarchforecast(fitORspec = garch_fits[[f]],
+                                        data = garch_vol[[f]], n.ahead = 10)
+    
+    predict_results <- cbind(predict_results, sigma(garch_forecast))
+    
+    garch_sst[[f]] <- sum(fund_tail_volatility - sigma(garch_forecast))
+    names(garch_sst)[f] <- paste('TES for',short_model_names[f])
+    
+  }
+  names(predict_results)[2:ncol(predict_results)] <- short_model_names 
+  
+  # Total error sum for models
+  print(garch_sst)
+  
+  #Comparing predicted volatility for models with actual one
+  print(predict_results)
+}
+```
+
+```{r}
+# Data loading
+df <- read.csv('Funds.csv', stringsAsFactors = F)
+df <- df[,-1]
+df$Date <- as.Date(df$Date)
+
+# Transforming data from df to xts
+funds <- xts(df[,2:ncol(df)], order.by = df$Date)
+funds <- na.omit(funds)
+rm(df)
+
+# Subseting original data for April of 2020 year
+funds_red <- funds['/202004']
+
+```
+
+```{r}
+get_volatiles <- function(funds, width = 22, time_scale = 1, funds_names) {
+    vol_df <- data.frame()
+    
+    for (i in 1:ncol(funds)) {
+      fund <- funds[,i]
+      temp <- rollapply(data = fund, width = 22, FUN = 'sd.annualized', scale = time_scale)
+      
+      if (nrow(vol_df) == 0) {
+        vol_df <- temp
+      } else {
+        vol_df <- cbind(vol_df, temp)    
+      }
+
+    }
+    names(vol_df) <- funds_names 
+    return(vol_df)
+}
+
+visualize_funds_lines <- function(funds, y_axis_label = 'Volatility') {
+  
+  for (i in 1:ncol(funds)) {
+    temp <- funds[,i]  
+    temp_mean <- mean(temp, na.rm = TRUE)
+    
+    p <- ggplot(temp, aes(x = index(temp), y = temp)) + 
+    geom_line(aes(color = 'Volatility')) +
+    geom_hline(aes(yintercept = temp_mean, color = 'Mean'),
+               size=.5, linetype='dashed') +
+    geom_text( aes( min(index(temp)) , temp_mean, label = round(temp_mean, 4), vjust = 2)) +
+    labs(x = 'Date', y = y_axis_label, title = names(funds)[i]) +
+    theme(plot.title = element_text(hjust = 0.5))
+    
+    suppressMessages(suppressWarnings(print(p)))
+  }
+}
+
+visualize_funds_hist <- function(funds, x_axis_label = 'Return') {
+  for (i in 1:ncol(funds)) {
+      temp <- funds[,i]  
+      title <- paste(funds_names[i], 'returns')
+      
+      chart.Histogram(temp,
+                methods = c('add.normal', 'add.density'), 
+                main = title)
+      
+      temp <- (temp - mean(temp, na.rm = T))/sd(temp, na.rm = T)        
+      title <- paste('Standardized', title)
+
+      chart.Histogram(temp,
+                      methods = c('add.normal', 'add.density'), 
+                      main = title)
+  }
+}
+
+```
+
+```{r}
+evaluate_garch <- function(fund, fund_vol) {
+  
+  # Models naming
+   model_names <- c('Standard GARCH with normal distribution of errors',
+                       'GJR GARCH with normal distribution of errors',
+                       'Standard GARCH with skewed Student t distribution of errors',
+                       'GJR GARCH with skewed Student t distribution of errors')
+
+  short_model_names <- c('Normal GARCH', 'Normal GJR', 'Skewed t GARCH', 'Skewed t GJR')
+
+  garch_fits <- get_garch_fits(fund)
+
+  names(garch_fits) <- model_names
+  
+  visualize_residuals(garch_fits)
+  
+  test_garch_models(garch_fits)
+  
+  print_garch_coefficients(garch_fits)
+  
+  compare_garch_models(garch_fits, short_model_names)
+  
+  visualize_dependecy_ret_var(garch_fits, short_model_names)
+  
+  garch_vol <- visualizing_volatility(garch_fits, short_model_names, fund_vol)
+  
+  predict_volatility(garch_fits = garch_fits,
+                     garch_vol = garch_vol,
+                     fund_vol = fund_vol,
+                     short_model_names = short_model_names)
+}
+```
+
+```{r}
+vol_df <- get_volatiles(funds, funds_names =  funds_names)
+vol_df <- na.omit(vol_df)
+visualize_funds_lines(vol_df)
+visualize_funds_hist(funds)
+fund_tail_volatility <- tail(vol_df$Vanguard, 10)
+```
+
+```{r}
+cat('Data up to 2020-04-30\n')
+for (i in 1:ncol(funds_red)) {
+    cat(colnames(vol_df)[i],'\n')
+    evaluate_garch(funds_red[,i], vol_df[,i])
+    cat('\n--------------------------------\n')
+}
+```
+
+```{r}
+cat('Data up to 2020-05-08\n')
+for (i in 1:ncol(funds)) {
+    cat(colnames(vol_df)[i],'\n')
+    evaluate_garch(funds_red[,i], vol_df[,i])
+    cat('\n--------------------------------\n')
+}
+```
